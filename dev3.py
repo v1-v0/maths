@@ -7,31 +7,45 @@ import re
 import io
 import time
 import base64
+import os
 
 # Configuration parameters
 CONFIG = {
     "primary_model": "llama3.2-vision",
     "fallback_models": ["llama3-vision", "llama2-vision"],
     "temperature": 0.1,
-    "max_tokens": 500,  # Reduced for per-line extraction
+    "max_tokens": 500,
     "ollama_base_url": "http://localhost:11434",
     "image_types": ['png', 'jpg', 'jpeg'],
     "max_file_size_mb": 5,
     "preprocessing_enabled": True
 }
 
+# Reference LaTeX template
+LATEX_TEMPLATE = """\\documentclass{article}
+\\usepackage{enumitem}
+\\begin{document}
+
+{content}
+
+\\end{document}"""
+
 # Extraction prompts
 EXTRACTION_PROMPTS = {
     "strict": r"""
-EXTRACT ONLY VISIBLE TEXT AND EQUATIONS FROM THIS LINE IMAGE.
+EXTRACT ONLY VISIBLE TEXT AND EQUATIONS FROM THIS IMAGE.
 
 CRITICAL RULES:
-1. Output ONLY what is VISIBLY PRESENT in this line image
+1. Output ONLY what is VISIBLY PRESENT in the image
 2. Use minimal LaTeX formatting - only what's needed to represent the math
-3. Maintain the EXACT layout and spacing of content
-4. For fractions, use simple LaTeX format: \frac{numerator}{denominator} with proper spacing
-5. Preserve circle symbols (○) ONLY where they actually appear in the image
-6. Do NOT add any formatting not in the original image
+3. Maintain the EXACT layout, spacing, and sequence of content
+4. Include ALL text (headers, questions, options, point values)
+5. For fractions, use simple LaTeX format: \frac{numerator}{denominator} with proper spacing
+6. Pay special attention to small text like "1 point" - do not miss it
+7. Preserve circle symbols (○) ONLY where they actually appear in the image
+8. Do NOT add circle symbols to headers, question text, or point values
+9. Include ALL answer options - don't skip any options
+10. Do NOT add any labels like "Options:" or bullet points that aren't in the image
 
 ABSOLUTELY DO NOT:
 - Add ANY descriptions of the image
@@ -44,42 +58,62 @@ ABSOLUTELY DO NOT:
 - Use complex LaTeX structures like arrays or tables
 - Wrap every math expression in \( \) or $ $ delimiters
 - Add bullet points or formatting not in the original image
+- Add questions like "What is the value of n?" if not in the image
+- Add circle symbols (○) to lines that don't have them in the image
 
-Your output must be EXACTLY what someone would get if they manually transcribed this line.
+Your output must be EXACTLY what someone would get if they manually transcribed all visible text and used minimal LaTeX for math, preserving all spacing and symbols.
 """,
     
     "example_based": r"""
-EXTRACT ONLY VISIBLE TEXT AND EQUATIONS FROM THIS LINE IMAGE.
+EXTRACT ONLY VISIBLE TEXT AND EQUATIONS FROM THIS IMAGE.
 
 Example of CORRECT extraction:
-Line image shows: "The expression \frac{1/n!}{1/(n+1)!} is equal to"
+Image shows: "QUESTION 5/6
+The expression 1/n! divided by 1/(n+1)! is equal to
+1 point
+○ n
+○ n+1
+○ (n+1)/n
+○ n/(n+1)"
 
 Correct output:
+QUESTION 5/6
+
 The expression \frac{1/n!}{1/(n+1)!} is equal to
 
-Example of INCORRECT extraction (DO NOT DO THIS):
-"The expression \( \frac{\frac{1}{n!}}{\frac{1}{(n+1)!}} \) is equal to what value?"
+1 point
 
-REMEMBER: 
-- Output ONLY the visible text and equations in this line
-- NO descriptions, analysis, or answers
-- Use minimal LaTeX - only what's needed for the math
-- NO LaTeX sectioning commands like \section{}
-- NO complex structures like arrays or tables
-- NO unnecessary delimiters around math expressions
-- Preserve circle symbols (○) ONLY where they actually appear
+○ n
+○ n+1
+○ (n+1)/n
+○ n/(n+1)
+
+Example of INCORRECT extraction (DO NOT DO THIS):
+"○ QUESTION 5/6
+
+○ The expression \frac{ \frac{1}{n}}{ \frac{1}{(n+1)!}} is equal to
+
+○ 1 point
+
+○ n
+○ n + 1"
+
 """,
     
     "two_pass": r"""
-EXTRACT ONLY VISIBLE TEXT AND EQUATIONS FROM THIS LINE IMAGE.
+EXTRACT ONLY VISIBLE TEXT AND EQUATIONS FROM THIS IMAGE.
 
 CRITICAL RULES:
-1. Output ONLY what is VISIBLY PRESENT in this line image
+1. Output ONLY what is VISIBLY PRESENT in the image
 2. Use minimal LaTeX formatting - only what's needed to represent the math
-3. Maintain the EXACT layout and spacing of content
-4. For fractions, use simple LaTeX format: \frac{numerator}{denominator} with proper spacing
-5. Preserve circle symbols (○) ONLY where they actually appear in the image
-6. Do NOT add any formatting not in the original image
+3. Maintain the EXACT layout, spacing, and sequence of content
+4. Include ALL text (headers, questions, options, point values)
+5. For fractions, use simple LaTeX format: \frac{numerator}{denominator} with proper spacing
+6. Pay special attention to small text like "1 point" - do not miss it
+7. Preserve circle symbols (○) ONLY where they actually appear in the image
+8. Do NOT add circle symbols to headers, question text, or point values
+9. Include ALL answer options - don't skip any options
+10. Do NOT add any labels like "Options:" or bullet points that aren't in the image
 
 ABSOLUTELY DO NOT:
 - Add ANY descriptions of the image
@@ -92,74 +126,14 @@ ABSOLUTELY DO NOT:
 - Use complex LaTeX structures like arrays or tables
 - Wrap every math expression in \( \) or $ $ delimiters
 - Add bullet points or formatting not in the original image
+- Add questions like "What is the value of n?" if not in the image
+- Add circle symbols (○) to lines that don't have them in the image
 
-Your output must be EXACTLY what someone would get if they manually transcribed this line.
+Your output must be EXACTLY what someone would get if they manually transcribed all visible text and used minimal LaTeX for math, preserving all spacing and symbols.
 """
 }
 
 # Helper functions for image processing
-# FIXED: Removed @st.cache_data decorator to avoid unhashable type error with PIL Image
-def segment_image_into_lines(image):
-    """
-    Segment an image into individual lines using OpenCV
-    
-    Args:
-        image: PIL Image or numpy array
-        
-    Returns:
-        List of line images and their coordinates
-    """
-    # Convert to numpy array if needed
-    if not isinstance(image, np.ndarray):
-        image_np = np.array(image)
-    
-    # Convert to grayscale
-    gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY) if len(image_np.shape) == 3 else image_np
-    
-    # Apply binary thresholding
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    
-    # Calculate horizontal projection profile
-    h_projection = np.sum(binary, axis=1)
-    
-    # Find line boundaries using projection profile
-    line_boundaries = []
-    in_line = False
-    start = 0
-    
-    for i, proj in enumerate(h_projection):
-        if not in_line and proj > 0:
-            # Start of a new line
-            in_line = True
-            start = i
-        elif in_line and proj == 0:
-            # End of a line
-            if i - start > 10:  # Minimum line height to avoid noise
-                line_boundaries.append((start, i))
-            in_line = False
-    
-    # Handle case where last line extends to bottom of image
-    if in_line:
-        line_boundaries.append((start, len(h_projection)))
-    
-    # Extract line images
-    line_images = []
-    for start, end in line_boundaries:
-        # Add padding around lines
-        padding = 5
-        start_padded = max(0, start - padding)
-        end_padded = min(image_np.shape[0], end + padding)
-        
-        line_img = image_np[start_padded:end_padded, :]
-        line_images.append({
-            'image': line_img,
-            'coordinates': (start_padded, end_padded),
-            'original_height': end - start
-        })
-    
-    return line_images
-
-# FIXED: Removed @st.cache_data decorator to avoid unhashable type error with PIL Image
 def preprocess_image(image):
     """Preprocess image to improve OCR quality"""
     if not CONFIG["preprocessing_enabled"]:
@@ -226,20 +200,19 @@ def check_image_quality(image):
     
     return True, "Image quality acceptable"
 
-def load_and_validate_image(uploaded_file):
-    """Load and validate the uploaded image"""
-    if uploaded_file is None:
-        return None, None
+def load_and_validate_image(image_path):
+    """Load and validate the image from path"""
+    if not os.path.exists(image_path):
+        return None, f"Image not found: {image_path}"
     
     try:
-        image = Image.open(uploaded_file)
+        image = Image.open(image_path)
         is_valid, message = check_image_quality(image)
         if not is_valid:
-            st.warning(message)
-        return image, uploaded_file.getvalue()
+            print(f"Warning: {message} for {image_path}")
+        return image, None
     except Exception as e:
-        st.error(f"Error loading image: {str(e)}")
-        return None, None
+        return None, f"Error loading image: {str(e)}"
 
 # Helper functions for extraction
 def clean_latex_formatting(text):
@@ -279,7 +252,7 @@ def clean_latex_formatting(text):
     text = re.sub(fraction_pattern, fix_fraction, text)
     
     # Fix trig functions - add \ if missing
-    for func in ['cos', 'sin', 'tan', 'sec', 'csc', 'cot']:
+    for func in ['cos', 'sin', 'tan', 'sec', 'csc', 'cot', 'log']:
         # Only add \ if it's not already there and it's a standalone function (not part of a word)
         text = re.sub(r'(?<![\\a-zA-Z])' + func + r'(?![a-zA-Z])', r'\\' + func, text)
     
@@ -320,8 +293,8 @@ def fix_spacing_and_symbols(text):
     
     return text
 
-def post_process_line_extraction(text):
-    """Post-process the extracted text from a single line"""
+def post_process_extraction(text):
+    """Post-process the extracted text"""
     # Remove any "ANSWER" text
     text = re.sub(r'(?i)ANSWER:?', '', text)
     
@@ -336,72 +309,34 @@ def post_process_line_extraction(text):
     
     return text
 
-def get_line_extraction_prompt(prompt_type, line_index, previous_results=None):
+def extract_content_from_image(image, model, prompt_type="strict"):
     """
-    Generate a context-aware prompt for line extraction
+    Extract content from an image
     
     Args:
-        prompt_type: Type of prompt to use
-        line_index: Index of current line
-        previous_results: Results from previous lines
-        
-    Returns:
-        Prompt string with context
-    """
-    base_prompt = EXTRACTION_PROMPTS.get(prompt_type, EXTRACTION_PROMPTS["strict"])
-    
-    # For first line, use base prompt
-    if line_index == 0 or previous_results is None:
-        return base_prompt + "\n\nThis is the first line of the image. Extract ONLY what is visible in this line segment."
-    
-    # For subsequent lines, add context from previous lines
-    context = "Previous lines extracted:\n"
-    
-    # Include up to 3 previous lines for context
-    start_idx = max(0, line_index - 3)
-    for i in range(start_idx, line_index):
-        if i < len(previous_results) and 'processed_extraction' in previous_results[i]:
-            context += f"Line {i+1}: {previous_results[i]['processed_extraction']}\n"
-    
-    context += f"\nNow extract ONLY what is visible in line {line_index+1}."
-    
-    return base_prompt + "\n\n" + context
-
-def extract_line_content(line_image, model, prompt_type, line_index=0, previous_results=None):
-    """
-    Extract content from a single line image
-    
-    Args:
-        line_image: Image of a single line
+        image: PIL Image
         model: Vision model to use
         prompt_type: Type of prompt to use
-        line_index: Index of current line
-        previous_results: Results from previous lines
         
     Returns:
-        Extraction result for the line
+        Extraction result
     """
-    # Convert line image to bytes for API
-    if isinstance(line_image, np.ndarray):
-        line_img = Image.fromarray(line_image)
-    else:
-        line_img = line_image
-        
+    # Convert image to bytes for API
     img_byte_arr = io.BytesIO()
-    line_img.save(img_byte_arr, format='PNG')
-    line_img_bytes = img_byte_arr.getvalue()
+    image.save(img_byte_arr, format='PNG')
+    img_bytes = img_byte_arr.getvalue()
     
-    # Get appropriate prompt with context from previous lines
-    prompt_content = get_line_extraction_prompt(prompt_type, line_index, previous_results)
+    # Get prompt
+    prompt_content = EXTRACTION_PROMPTS.get(prompt_type, EXTRACTION_PROMPTS["strict"])
     
-    # Extract content from line
+    # Extract content from image
     try:
         response = ollama.chat(
             model=model,
             messages=[{
                 'role': 'user',
                 'content': prompt_content,
-                'images': [line_img_bytes]
+                'images': [img_bytes]
             }],
             options={
                 "temperature": CONFIG["temperature"],
@@ -412,90 +347,224 @@ def extract_line_content(line_image, model, prompt_type, line_index=0, previous_
         extracted_content = response.message.content
         
         # Post-process the extraction
-        processed_content = post_process_line_extraction(extracted_content)
+        processed_content = post_process_extraction(extracted_content)
         
         # Return result with metadata
         return {
-            'line_number': line_index,
             'raw_extraction': extracted_content,
             'processed_extraction': processed_content,
-            'user_modified': False,
-            'user_content': None
+            'success': True
         }
         
     except Exception as e:
         # Handle extraction errors
         return {
-            'line_number': line_index,
             'error': str(e),
-            'user_modified': False,
-            'user_content': None
+            'success': False
         }
 
-def process_lines_sequentially(line_images, model, prompt_type="strict"):
+def parse_extracted_content(extracted_text):
     """
-    Process each line image sequentially through the vision model
+    Parse extracted text into structured components
     
     Args:
-        line_images: List of line image dictionaries
+        extracted_text: Extracted text from image
+        
+    Returns:
+        Dictionary with question components
+    """
+    # Split the text into lines
+    lines = extracted_text.strip().split('\n')
+    
+    # Initialize variables
+    question_header = ""
+    question_text = ""
+    point_value = ""
+    options = []
+    current_section = "header"
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        # Check if this is a question header line
+        if line.startswith("QUESTION"):
+            question_header = line
+            current_section = "header"
+            continue
+            
+        # Check if this is the point value line
+        if "point" in line.lower():
+            point_value = line
+            current_section = "points"
+            continue
+            
+        # Check if this is an option line (starts with circle symbol)
+        if line.startswith("○"):
+            current_section = "options"
+            # Remove the circle symbol and clean up
+            option = line[1:].strip()
+            options.append(option)
+        elif current_section == "options" and not line.startswith("QUESTION") and "point" not in line.lower():
+            # This might be an option without the circle symbol
+            options.append(line)
+        elif current_section != "options" and not line.startswith("QUESTION") and "point" not in line.lower():
+            # This is likely the question text
+            question_text += line + " "
+    
+    # Clean up question text
+    question_text = question_text.strip()
+    
+    return {
+        'header': question_header,
+        'question_text': question_text,
+        'point_value': point_value,
+        'options': options
+    }
+
+def convert_to_latex_format(parsed_content):
+    """
+    Convert parsed content to LaTeX format
+    
+    Args:
+        parsed_content: Dictionary with question components
+        
+    Returns:
+        LaTeX formatted text
+    """
+    latex_output = f"{parsed_content['header']}\n\n"
+    latex_output += f"{parsed_content['question_text']}\n\n"
+    latex_output += f"{parsed_content['point_value']}\n\n"
+    latex_output += "\\begin{enumerate}[label=]\n"
+    
+    for option in parsed_content['options']:
+        latex_output += f"    \\item ${option}$\n"
+    
+    latex_output += "\\end{enumerate}\n\n"
+    
+    return latex_output
+
+def batch_process_images(image_paths, model, prompt_type="strict"):
+    """
+    Process multiple images and extract content
+    
+    Args:
+        image_paths: List of image paths
         model: Vision model to use
         prompt_type: Type of prompt to use
         
     Returns:
-        List of extraction results for each line
+        Dictionary of extraction results
     """
-    results = []
+    results = {}
     
-    # Process each line
-    for i, line_data in enumerate(line_images):
-        with st.spinner(f"Processing line {i+1} of {len(line_images)}..."):
-            # Extract content from line
-            result = extract_line_content(
-                line_data['image'],
-                model,
-                prompt_type,
-                i,
-                results
-            )
-            
-            # Add coordinates to result
-            result['coordinates'] = line_data['coordinates']
-            
-            # Add result to list
-            results.append(result)
-            
-            # Show progress
-            st.progress((i + 1) / len(line_images))
+    for i, image_path in enumerate(image_paths):
+        print(f"Processing image {i+1}/{len(image_paths)}: {image_path}")
+        
+        # Load and validate image
+        image, error = load_and_validate_image(image_path)
+        if error:
+            results[image_path] = {
+                'error': error,
+                'success': False
+            }
+            continue
+        
+        # Preprocess image if enabled
+        if CONFIG["preprocessing_enabled"]:
+            processed_image, _ = preprocess_image(image)
+        else:
+            processed_image = image
+        
+        # Extract content
+        result = extract_content_from_image(processed_image, model, prompt_type)
+        
+        # Add image path to result
+        result['image_path'] = image_path
+        
+        # Add to results
+        results[image_path] = result
+        
+        # Parse and convert to LaTeX format
+        if result['success']:
+            parsed_content = parse_extracted_content(result['processed_extraction'])
+            latex_text = convert_to_latex_format(parsed_content)
+            result['parsed_content'] = parsed_content
+            result['latex_text'] = latex_text
+        
+        # Wait a bit to avoid rate limiting
+        time.sleep(1)
     
     return results
 
-def assemble_final_output(extraction_results):
+def compile_latex_document(extraction_results, template=LATEX_TEMPLATE):
     """
-    Assemble the final output from all line extraction results
+    Compile extraction results into a LaTeX document
     
     Args:
-        extraction_results: List of extraction results for each line
+        extraction_results: Dictionary of extraction results
+        template: LaTeX template string
         
     Returns:
-        Final assembled text
+        Complete LaTeX document
     """
-    final_text = []
+    # Sort results by question number
+    sorted_results = []
+    for path, result in extraction_results.items():
+        if result['success']:
+            # Extract question number from filename
+            match = re.search(r'DiagnosticQ-(\d+)of6', os.path.basename(path))
+            if match:
+                question_number = int(match.group(1))
+                sorted_results.append((question_number, result))
     
-    for result in extraction_results:
-        # Use user-modified content if available, otherwise use processed extraction
-        if result['user_modified'] and result['user_content']:
-            line_text = result['user_content']
-        elif 'processed_extraction' in result:
-            line_text = result['processed_extraction']
-        else:
-            continue  # Skip lines with errors and no user edits
-        
-        final_text.append(line_text)
+    # Sort by question number
+    sorted_results.sort()
     
-    # Join lines with appropriate spacing
-    return '\n'.join(final_text)
+    # Combine all LaTeX content
+    content = ""
+    for _, result in sorted_results:
+        if 'latex_text' in result:
+            content += result['latex_text']
+    
+    # Insert content into template
+    latex_doc = template.format(content=content)
+    
+    return latex_doc
 
-# UI Components
+def validate_latex_document(latex_doc):
+    """
+    Validate LaTeX document for common issues
+    
+    Args:
+        latex_doc: LaTeX document string
+        
+    Returns:
+        Tuple of (is_valid, issues)
+    """
+    issues = []
+    
+    # Check for missing question numbers
+    for i in range(1, 7):
+        if f"QUESTION {i}/6" not in latex_doc:
+            issues.append(f"Missing Question {i}")
+    
+    # Check for missing point values
+    if latex_doc.count("1 point") < 6:
+        issues.append("Some questions are missing point values")
+    
+    # Check for missing enumerate environments
+    if latex_doc.count("\\begin{enumerate}") != latex_doc.count("\\end{enumerate}"):
+        issues.append("Mismatched enumerate environments")
+    
+    # Check for missing options
+    if latex_doc.count("\\item") < 24:  # 6 questions * 4 options
+        issues.append("Some questions are missing options")
+    
+    return len(issues) == 0, issues
+
+# UI Components for Streamlit app
 def create_copy_button_html(text_to_copy):
     """Create HTML for a copy button"""
     # Encode the text for JavaScript
@@ -530,137 +599,37 @@ def create_copy_button_html(text_to_copy):
     
     return copy_button_html
 
-def create_format_options_and_copy(extraction_results):
-    """
-    Create format options and copy button for the final output
-    
-    Args:
-        extraction_results: List of extraction results for each line
-        
-    Returns:
-        None (displays UI elements in the Streamlit app)
-    """
-    st.markdown("## Final Output")
-    
-    # Assemble final text
-    final_text = assemble_final_output(extraction_results)
-    
-    # Display the final text
-    st.text_area("Extracted Content:", value=final_text, height=300, key="final_output")
-    
-    # Format options
-    format_option = st.radio(
-        "Copy Format:",
-        ["Plain Text", "LaTeX", "Markdown"],
-        horizontal=True
-    )
-    
-    # Format the text based on selection
-    if format_option == "Plain Text":
-        formatted_text = final_text
-    elif format_option == "LaTeX":
-        # Convert to LaTeX document format
-        formatted_text = "\\documentclass{article}\n\\usepackage{amsmath}\n\\begin{document}\n" + final_text + "\n\\end{document}"
-    else:  # Markdown
-        # Keep as is since our output is already markdown compatible
-        formatted_text = final_text
-    
-    # Create copy button for the formatted text
-    st.components.v1.html(create_copy_button_html(formatted_text), height=50)
-    
-    # Add download button
-    st.download_button(
-        label="Download as Text File",
-        data=formatted_text,
-        file_name=f"extracted_math_{format_option.lower().replace(' ', '_')}.txt",
-        mime="text/plain"
-    )
-
-def create_line_review_ui(line_images, extraction_results):
-    """
-    Create an interactive UI for reviewing and editing line extractions
-    
-    Args:
-        line_images: List of line image dictionaries
-        extraction_results: List of extraction results for each line
-        
-    Returns:
-        Updated extraction results with user modifications
-    """
-    st.markdown("## Line-by-Line Review")
-    st.info("Review each extracted line and make corrections if needed.")
-    
-    # Initialize session state for storing edits if not exists
-    if 'line_edits' not in st.session_state:
-        st.session_state.line_edits = [None] * len(extraction_results)
-    
-    # Create tabs for navigation between lines
-    tab_labels = [f"Line {i+1}" for i in range(len(line_images))]
-    tabs = st.tabs(tab_labels)
-    
-    # Display each line in its own tab
-    for i, tab in enumerate(tabs):
-        with tab:
-            # Display line image
-            line_img = Image.fromarray(line_images[i]['image'])
-            st.image(line_img, caption=f"Line {i+1}", use_container_width=True)
-            
-            # Get extraction result
-            result = extraction_results[i]
-            
-            # Check if there was an error
-            if 'error' in result:
-                st.error(f"Error extracting this line: {result['error']}")
-                extracted_text = ""
-            else:
-                extracted_text = result['processed_extraction']
-            
-            # Create editable text field with extracted content
-            edited_text = st.text_area(
-                "Extracted Text (edit if needed):",
-                value=st.session_state.line_edits[i] if st.session_state.line_edits[i] is not None else extracted_text,
-                key=f"line_edit_{i}",
-                height=100
-            )
-            
-            # Store edited text in session state
-            st.session_state.line_edits[i] = edited_text
-            
-            # Update extraction result with user edits
-            extraction_results[i]['user_modified'] = (edited_text != extracted_text)
-            extraction_results[i]['user_content'] = edited_text
-    
-    return extraction_results
-
-# Main application
 def main():
-    """Main application function"""
+    """Main Streamlit application"""
     # Page configuration
     st.set_page_config(
-        page_title="Line-by-Line Math Equation Extractor",
-        page_icon="🦙",
+        page_title="Math Quiz LaTeX Generator",
+        page_icon="🧮",
         layout="wide",
         initial_sidebar_state="expanded"
     )
     
     # Title and description
-    st.title("🦙 Line-by-Line Math Equation Extractor")
-    st.markdown('<p style="margin-top: -20px;">Extract and edit math equations line by line</p>', unsafe_allow_html=True)
+    st.title("🧮 Math Quiz LaTeX Generator")
+    st.markdown('<p style="margin-top: -20px;">Extract math equations from images and generate LaTeX documents</p>', unsafe_allow_html=True)
     
     # Initialize session state
     if 'current_step' not in st.session_state:
         st.session_state.current_step = "upload"
-    if 'line_images' not in st.session_state:
-        st.session_state.line_images = None
     if 'extraction_results' not in st.session_state:
         st.session_state.extraction_results = None
+    if 'edited_latex' not in st.session_state:
+        st.session_state.edited_latex = {}
+    if 'final_latex' not in st.session_state:
+        st.session_state.final_latex = None
+    if 'reference_latex' not in st.session_state:
+        st.session_state.reference_latex = None
     
     # Sidebar for settings and upload
     with st.sidebar:
-        st.header("Upload Image")
-        uploaded_file = st.file_uploader("Choose an image...", type=CONFIG["image_types"])
+        st.header("Settings")
         
-        st.header("Extraction Settings")
+        # Extraction method
         extraction_method = st.radio(
             "Extraction Method",
             ["Strict", "Example-Based", "Two-Pass Verification"],
@@ -680,6 +649,14 @@ def main():
         preprocessing_enabled = st.checkbox("Enable Image Preprocessing", value=CONFIG["preprocessing_enabled"])
         CONFIG["preprocessing_enabled"] = preprocessing_enabled
         
+        # Reference LaTeX file upload
+        st.header("Reference LaTeX")
+        reference_file = st.file_uploader("Upload reference LaTeX file (optional)", type=["tex"])
+        if reference_file:
+            reference_content = reference_file.getvalue().decode("utf-8")
+            st.session_state.reference_latex = reference_content
+            st.success("Reference LaTeX file loaded")
+        
         # Advanced settings in expander
         with st.expander("Advanced Settings"):
             CONFIG["primary_model"] = st.selectbox(
@@ -692,98 +669,163 @@ def main():
         # Reset button
         if st.button("Reset Process"):
             st.session_state.current_step = "upload"
-            st.session_state.line_images = None
             st.session_state.extraction_results = None
-            st.session_state.line_edits = None
+            st.session_state.edited_latex = {}
+            st.session_state.final_latex = None
             st.rerun()
     
     # Main content area - Multi-step workflow
     if st.session_state.current_step == "upload":
-        # Step 1: Upload and segment image
-        st.markdown("## Step 1: Upload and Segment Image")
+        # Step 1: Upload images
+        st.markdown("## Step 1: Upload Images")
+        st.info("Upload all six diagnostic quiz images to begin the extraction process.")
         
-        if uploaded_file is not None:
-            image, image_data = load_and_validate_image(uploaded_file)
+        # File uploader for multiple images
+        uploaded_files = st.file_uploader(
+            "Upload quiz images", 
+            type=CONFIG["image_types"],
+            accept_multiple_files=True
+        )
+        
+        if uploaded_files:
+            # Save uploaded files to disk
+            image_paths = []
+            for file in uploaded_files:
+                file_path = os.path.join("/tmp", file.name)
+                with open(file_path, "wb") as f:
+                    f.write(file.getbuffer())
+                image_paths.append(file_path)
             
-            if image is not None:
-                st.image(image, caption="Uploaded Image", use_container_width=True)
-                
-                if st.button("Process Image Line by Line", type="primary"):
-                    with st.spinner("Segmenting image into lines..."):
-                        # Segment image into lines
-                        line_images = segment_image_into_lines(image)
-                        st.session_state.line_images = line_images
-                        
-                        # Show preview of segmentation
-                        st.success(f"Image segmented into {len(line_images)} lines")
-                        
-                        # Display segmentation preview
-                        cols = st.columns(min(3, len(line_images)))
-                        for i, line_data in enumerate(line_images[:3]):
-                            with cols[i % 3]:
-                                line_img = Image.fromarray(line_data['image'])
-                                st.image(line_img, caption=f"Line {i+1}", use_container_width=True)
-                        
-                        if len(line_images) > 3:
-                            st.info(f"... and {len(line_images) - 3} more lines")
-                        
-                        # Move to next step
-                        st.session_state.current_step = "extract"
-                        st.rerun()
-        else:
-            st.info("Please upload an image to begin.")
-    
-    elif st.session_state.current_step == "extract":
-        # Step 2: Extract content from each line
-        st.markdown("## Step 2: Extract Content from Lines")
-        
-        if st.session_state.line_images:
-            if st.button("Begin Line-by-Line Extraction", type="primary"):
-                with st.spinner("Extracting content from lines..."):
-                    # Process each line
-                    extraction_results = process_lines_sequentially(
-                        st.session_state.line_images,
-                        CONFIG["primary_model"],
+            # Display uploaded images
+            st.success(f"Uploaded {len(image_paths)} images")
+            
+            # Display image previews
+            cols = st.columns(3)
+            for i, path in enumerate(image_paths[:6]):  # Show up to 6 images
+                with cols[i % 3]:
+                    image = Image.open(path)
+                    st.image(image, caption=f"Image {i+1}", use_container_width=True)
+            
+            # Process button
+            if st.button("Extract Content from Images", type="primary"):
+                with st.spinner("Extracting content from images..."):
+                    # Process all images
+                    results = batch_process_images(
+                        image_paths, 
+                        CONFIG["primary_model"], 
                         selected_prompt
                     )
-                    st.session_state.extraction_results = extraction_results
                     
-                    # Show extraction preview
-                    st.success(f"Extracted content from {len(extraction_results)} lines")
+                    # Store results in session state
+                    st.session_state.extraction_results = results
+                    
+                    # Initialize edited_latex with the initial LaTeX text
+                    for path, result in results.items():
+                        if result['success'] and 'latex_text' in result:
+                            # Extract question number from filename
+                            match = re.search(r'(\d+)of6', os.path.basename(path))
+                            if match:
+                                question_number = int(match.group(1))
+                                st.session_state.edited_latex[question_number] = result['latex_text']
                     
                     # Move to next step
                     st.session_state.current_step = "review"
                     st.rerun()
-            
-            # Option to go back
-            if st.button("Back to Upload"):
-                st.session_state.current_step = "upload"
-                st.rerun()
-        else:
-            st.error("No line images found. Please go back and upload an image.")
-            if st.button("Back to Upload"):
-                st.session_state.current_step = "upload"
-                st.rerun()
     
     elif st.session_state.current_step == "review":
-        # Step 3: Review and edit line by line
-        st.markdown("## Step 3: Review and Edit")
+        # Step 2: Review and edit extractions
+        st.markdown("## Step 2: Review and Edit Extractions")
+        st.info("Review each extracted question and make corrections if needed.")
         
-        if st.session_state.line_images and st.session_state.extraction_results:
-            updated_results = create_line_review_ui(
-                st.session_state.line_images,
-                st.session_state.extraction_results
-            )
-            st.session_state.extraction_results = updated_results
+        if st.session_state.extraction_results:
+            # Create tabs for each question
+            tab_labels = [f"Question {i}" for i in range(1, 7)]
+            tabs = st.tabs(tab_labels)
             
-            # Button to finalize
+            # Sort results by question number
+            sorted_results = []
+            for path, result in st.session_state.extraction_results.items():
+                if result['success']:
+                    # Extract question number from filename
+                    match = re.search(r'(\d+)of6', os.path.basename(path))
+                    if match:
+                        question_number = int(match.group(1))
+                        sorted_results.append((question_number, result))
+            
+            # Sort by question number
+            sorted_results.sort()
+            
+            # Display each question in its own tab
+            for i, (question_number, result) in enumerate(sorted_results):
+                with tabs[i]:
+                    # Display original image
+                    image = Image.open(result['image_path'])
+                    st.image(image, caption=f"Question {question_number}", use_container_width=True)
+                    
+                    # Display extracted text
+                    st.subheader("Extracted Text")
+                    st.text_area(
+                        "Raw Extraction",
+                        value=result['processed_extraction'],
+                        height=150,
+                        key=f"raw_{question_number}",
+                        disabled=True
+                    )
+                    
+                    # Display LaTeX format with editing
+                    st.subheader("LaTeX Format")
+                    edited_latex = st.text_area(
+                        "Edit LaTeX if needed",
+                        value=st.session_state.edited_latex.get(question_number, result.get('latex_text', '')),
+                        height=300,
+                        key=f"latex_{question_number}"
+                    )
+                    
+                    # Save edits to session state
+                    st.session_state.edited_latex[question_number] = edited_latex
+            
+            # Buttons for navigation
             col1, col2 = st.columns(2)
             with col1:
-                if st.button("Back to Extraction"):
-                    st.session_state.current_step = "extract"
+                if st.button("Back to Upload"):
+                    st.session_state.current_step = "upload"
                     st.rerun()
             with col2:
-                if st.button("Finalize Extraction", type="primary"):
+                if st.button("Generate LaTeX Document", type="primary"):
+                    # Compile LaTeX document from edited content
+                    if st.session_state.reference_latex:
+                        # Use reference LaTeX as template
+                        template_parts = st.session_state.reference_latex.split("\\begin{document}")
+                        if len(template_parts) > 1:
+                            preamble = template_parts[0] + "\\begin{document}\n\n"
+                            latex_doc = preamble
+                            
+                            # Add each question's edited LaTeX content
+                            for question_number in sorted(st.session_state.edited_latex.keys()):
+                                latex_doc += st.session_state.edited_latex[question_number]
+                            
+                            # Close document
+                            latex_doc += "\\end{document}"
+                        else:
+                            # Fallback to default template
+                            latex_doc = compile_latex_document({
+                                f"q{i}": {"success": True, "latex_text": text} 
+                                for i, text in st.session_state.edited_latex.items()
+                            })
+                    else:
+                        # Use default template
+                        latex_doc = compile_latex_document({
+                            f"q{i}": {"success": True, "latex_text": text} 
+                            for i, text in st.session_state.edited_latex.items()
+                        })
+                    
+                    # Validate the document
+                    is_valid, issues = validate_latex_document(latex_doc)
+                    
+                    # Save to session state
+                    st.session_state.final_latex = latex_doc
+                    
+                    # Move to next step
                     st.session_state.current_step = "finalize"
                     st.rerun()
         else:
@@ -793,30 +835,52 @@ def main():
                 st.rerun()
     
     elif st.session_state.current_step == "finalize":
-        # Step 4: Show final output with copy options
-        st.markdown("## Step 4: Final Output")
+        # Step 3: Finalize and download
+        st.markdown("## Step 3: Finalize LaTeX Document")
         
-        if st.session_state.extraction_results:
-            create_format_options_and_copy(st.session_state.extraction_results)
+        if st.session_state.final_latex:
+            # Validate the document
+            is_valid, issues = validate_latex_document(st.session_state.final_latex)
+            
+            # Display validation results
+            if not is_valid:
+                st.warning("The LaTeX document has some potential issues:")
+                for issue in issues:
+                    st.write(f"- {issue}")
+            else:
+                st.success("LaTeX document validation passed!")
+            
+            # Display final LaTeX
+            st.subheader("Final LaTeX Document")
+            st.text_area(
+                "LaTeX Code",
+                value=st.session_state.final_latex,
+                height=400,
+                key="final_latex"
+            )
+            
+            # Copy button
+            st.components.v1.html(create_copy_button_html(st.session_state.final_latex), height=50)
+            
+            # Download button
+            st.download_button(
+                label="Download LaTeX File",
+                data=st.session_state.final_latex,
+                file_name="math_quiz.tex",
+                mime="text/plain"
+            )
             
             # Button to start over
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("Back to Review"):
-                    st.session_state.current_step = "review"
-                    st.rerun()
-            with col2:
-                if st.button("Process Another Image"):
-                    # Reset session state
-                    st.session_state.current_step = "upload"
-                    st.session_state.line_images = None
-                    st.session_state.extraction_results = None
-                    st.session_state.line_edits = None
-                    st.rerun()
-        else:
-            st.error("No extraction results found. Please go back and extract content.")
-            if st.button("Back to Upload"):
+            if st.button("Process Another Set of Images"):
                 st.session_state.current_step = "upload"
+                st.session_state.extraction_results = None
+                st.session_state.edited_latex = {}
+                st.session_state.final_latex = None
+                st.rerun()
+        else:
+            st.error("No LaTeX document generated. Please go back and review extractions.")
+            if st.button("Back to Review"):
+                st.session_state.current_step = "review"
                 st.rerun()
 
 if __name__ == "__main__":
