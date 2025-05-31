@@ -2,6 +2,12 @@
 
 A Streamlit app for extracting **only visible text and mathematical expressions** from images, with strict rules to avoid any analysis, explanations, or added formatting. Powered by Llama Vision models via Ollama.
 
+## System Flowchart
+
+![System Flowchart](./math_extractor_flowchart.png)
+
+---
+
 ## Features
 
 - **Strict Extraction:** Outputs only what is visibly present in the image, with minimal LaTeX for math.
