@@ -1,49 +1,104 @@
-# LaTeX-OCR
+# Accurate Math Equation Extractor
 
-This project leverages Llama 3.2 vision and Streamlit to create a LaTeX OCR app that converts images of LaTeX equations to LaTeX code.
+A Streamlit app for extracting **only visible text and mathematical expressions** from images, with strict rules to avoid any analysis, explanations, or added formatting. Powered by Llama Vision models via Ollama.
 
-## Demo Video
+## Features
 
-Click below to watch the demo video of the AI Assistant in action:
+- **Strict Extraction:** Outputs only what is visibly present in the image, with minimal LaTeX for math.
+- **No Analysis or Explanations:** Absolutely no added content, analysis, or formatting.
+- **Preserves Layout:** Maintains the exact layout, spacing, and sequence of the original image.
+- **Handles Math and Symbols:** Properly extracts fractions, trigonometric functions, and circle symbols (○) only where they appear.
+- **Two-Pass Verification:** Optional double-check for complex images.
+- **Preprocessing:** Optional image preprocessing for better OCR results.
+- **Debug Tools:** Built-in checks for LaTeX, symbols, and prohibited content.
 
-[Watch the video](LaTeX-OCR.mp4)
+## Requirements
 
-## Installation and setup
+- Python 3.8+
+- [Streamlit](https://streamlit.io/)
+- [Ollama](https://ollama.com/) (running locally with vision models)
+- [Pillow](https://pillow.readthedocs.io/)
+- [NumPy](https://numpy.org/)
+- [OpenCV](https://opencv.org/)
 
-**Setup Ollama**:
+Install dependencies:
 
-   *On Linux*:
-   ```bash 
-   curl -fsSL https://ollama.com/install.sh | sh
-   # pull llama 3.2 vision model
-   ollama run llama3.2-vision 
-   ```
+```bash
+pip install streamlit pillow numpy opencv-python
+```
 
-   *On MacOS*:
-   ```bash 
-   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"    # get homebrew
-   xcode-select --install
-   brew install ollama    # install ollama
-   ollama pull llama3.2-vision    # pull llama 3.2 vision model
-   ollama run llama3.2-vision 
-   ```
+## Usage
 
-
-**Install Dependencies**:
-   Ensure you have Python 3.11 or later installed.
+1. **Start Ollama** with the required vision models (e.g., `llama3.2-vision`).
+2. **Run the app:**
    ```bash
-   pip install streamlit ollama
+   streamlit run dev.py
    ```
+3. **Upload an image** (PNG, JPG, JPEG) in the sidebar.
+4. **Choose extraction method:**
+   - **Strict:** Strict rules, minimal LaTeX, no added formatting.
+   - **Example-Based:** Uses examples to guide extraction.
+   - **Two-Pass Verification:** Double-checks extraction for completeness.
+5. **(Optional) Enable preprocessing** for better OCR on noisy images.
+6. **Click "Extract Content"** to process the image.
+7. **Review results:** Copy extracted text, view original and rendered preview, and check debug information.
+
+## Extraction Rules
+
+- Output **only** what is **visibly present** in the image.
+- Use **minimal LaTeX** (e.g., `\frac{a}{b}` for fractions, `\cos` for cosine).
+- **Do not** add explanations, analysis, or any text not in the image.
+- **Preserve** all original symbols, especially circle symbols (○) for options.
+- **Do not** add bullet points, headers, or labels not present in the image.
+- **No LaTeX sectioning** (`\section{}`), arrays, or complex structures.
+
+## Example
+
+**Image shows:**
+
+```
+QUESTION 5/6
+The expression 1/n! divided by 1/(n+1)! is equal to
+1 point
+○ n
+○ n+1
+○ (n+1)/n
+○ n/(n+1)
+```
+
+**Correct output:**
+
+```
+QUESTION 5/6
+
+The expression \frac{1/n!}{1/(n+1)!} is equal to
+
+1 point
+
+○ n
+○ n+1
+○ (n+1)/n
+○ n/(n+1)
+```
+
+## Configuration
+
+Edit the `CONFIG` dictionary in `dev.py` to adjust:
+
+- Model names
+- Temperature and max tokens
+- Preprocessing defaults
+- Allowed image types
+
+## Notes
+
+- The app is designed for **math education** and **assessment** scenarios where accuracy and fidelity to the original image are critical.
+- Debug information is available in an expander at the bottom of the app for troubleshooting and validation.
+
+## License
+
+MIT License
 
 ---
 
-## 📬 Stay Updated with Our Newsletter!
-**Get a FREE Data Science eBook** 📖 with 150+ essential lessons in Data Science when you subscribe to our newsletter! Stay in the loop with the latest tutorials, insights, and exclusive resources. [Subscribe now!](https://join.dailydoseofds.com)
-
-[![Daily Dose of Data Science Newsletter](https://github.com/patchy631/ai-engineering/blob/main/resources/join_ddods.png)](https://join.dailydoseofds.com)
-
----
-
-## Contribution
-
-Contributions are welcome! Please fork the repository and submit a pull request with your improvements.
+**Developed for accurate, analysis-free math extraction using Llama Vision models.**
